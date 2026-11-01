@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/alireza0/s-ui/core/quicgrace"
 	"github.com/alireza0/s-ui/core/usersession"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -33,10 +34,10 @@ type Inbound struct {
 	tlsConfig tls.ServerConfig
 	service   *hysteria.Service[string]
 	sessions  *usersession.Registry
+	quic      *quicgrace.Sessions
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HysteriaInboundOptions) (adapter.Inbound, error) {
-	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
 	}
@@ -54,6 +55,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			Listen:  options.ListenOptions,
 		}),
 		tlsConfig: tlsConfig,
+		quic:      quicgrace.NewSessions(),
 	}
 	var sendBps, receiveBps uint64
 	if options.Up.Value() > 0 {
@@ -78,10 +80,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		SendBPS:       sendBps,
 		ReceiveBPS:    receiveBps,
 		XPlusPassword: options.Obfs,
-		TLSConfig:     tlsConfig,
-		QUICOptions:   buildInboundQUICOptions(options),
-		UDPTimeout:    udpTimeout,
-		Handler:       inbound,
+		// quicgrace: see hysteria2 (qtls.Listen's defaults).
+		TLSConfig:   quicgrace.Wrap(tlsConfig, quicgrace.Options{Sessions: inbound.quic}),
+		QUICOptions: buildInboundQUICOptions(options),
+		UDPTimeout:  udpTimeout,
+		Handler:     inbound,
 	})
 	if err != nil {
 		return nil, err
@@ -123,6 +126,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
 		metadata.User = userName
 		h.sessions.Bind(userName, source.String())
+		h.sessions.Track(source.String(), h.quic.Closer(source.String()))
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
@@ -149,6 +153,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
 		metadata.User = userName
 		h.sessions.Bind(userName, source.String())
+		h.sessions.Track(source.String(), h.quic.Closer(source.String()))
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
@@ -156,7 +161,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -165,18 +170,17 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(h.tlsConfig.Close)
 	}
 	packetConn, err := h.listener.ListenUDP()
 	if err != nil {
 		return err
 	}
-	return h.service.Start(packetConn)
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(
-		h.listener,
-		h.tlsConfig,
-		common.PtrOrNil(h.service),
-	)
+	scope.Add(h.listener.Close)
+	err = h.service.Start(packetConn)
+	if err != nil {
+		return err
+	}
+	scope.Add(h.service.Close)
+	return nil
 }

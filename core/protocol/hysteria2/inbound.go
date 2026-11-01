@@ -10,10 +10,12 @@ import (
 	"os"
 	"time"
 
+	"github.com/alireza0/s-ui/core/quicgrace"
 	"github.com/alireza0/s-ui/core/usersession"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
@@ -44,10 +46,10 @@ type Inbound struct {
 	tlsConfig tls.ServerConfig
 	service   *hysteria2.Service[string]
 	sessions  *usersession.Registry
+	quic      *quicgrace.Sessions
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2InboundOptions) (adapter.Inbound, error) {
-	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
 	}
@@ -125,6 +127,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			Listen:  options.ListenOptions,
 		}),
 		tlsConfig: tlsConfig,
+		quic:      quicgrace.NewSessions(),
 	}
 	var udpTimeout time.Duration
 	if options.UDPTimeout != 0 {
@@ -143,11 +146,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 				return nil, E.New("realm.ip_version 4 conflicts with listen address ", listenAddr)
 			}
 		}
-		queryOptions, err := adapter.DNSQueryOptionsFrom(ctx, options.Realm.STUNDomainResolver)
-		if err != nil {
-			return nil, err
+		var queryOptions adapter.DNSQueryOptions
+		if options.Realm.STUNServersIsDomain() {
+			queryOptions, err = dialer.NewDNSQueryOptions(ctx, options.Realm.STUNDomainResolver, true)
+			if err != nil {
+				return nil, E.Cause(err, "create realm STUN domain resolver")
+			}
 		}
-		httpClientTransport, err := service.FromContext[adapter.HTTPClientManager](ctx).ResolveTransport(ctx, logger, common.PtrValueOrDefault(options.Realm.HTTPClient))
+		var httpClientTransport adapter.HTTPTransport
+		httpClientTransport, err = service.FromContext[adapter.HTTPClientManager](ctx).ResolveTransport(ctx, logger, common.PtrValueOrDefault(options.Realm.HTTPClient))
 		if err != nil {
 			return nil, E.Cause(err, "create realm http client")
 		}
@@ -188,7 +195,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		GeckoPassword:      geckoPassword,
 		GeckoMinPacketSize: geckoMinPacketSize,
 		GeckoMaxPacketSize: geckoMaxPacketSize,
-		TLSConfig:          tlsConfig,
+		// quicgrace: closing the inbound sends its clients a CONNECTION_CLOSE
+		// instead of leaving them to a 30-second idle timeout, and gives the
+		// session registry a handle to close one client's session. The two
+		// options are the ones the service itself would listen with.
+		TLSConfig: quicgrace.Wrap(tlsConfig, quicgrace.Options{
+			DisableVersionNegotiationPackets: salamanderPassword != "" || geckoPassword != "",
+			StatelessReset:                   salamanderPassword == "" && geckoPassword == "",
+			Sessions:                         inbound.quic,
+		}),
 		QUICOptions: qtls.QUICOptions{
 			IdleTimeout:             options.IdleTimeout.Build(),
 			KeepAlivePeriod:         options.KeepAlivePeriod.Build(),
@@ -239,6 +254,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
 		metadata.User = userName
 		h.sessions.Bind(userName, source.String())
+		h.sessions.Track(source.String(), h.quic.Closer(source.String()))
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
@@ -265,6 +281,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
 		metadata.User = userName
 		h.sessions.Bind(userName, source.String())
+		h.sessions.Track(source.String(), h.quic.Closer(source.String()))
 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
@@ -272,7 +289,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -281,22 +298,21 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(h.tlsConfig.Close)
 	}
 	packetConn, err := h.listener.ListenUDP()
 	if err != nil {
 		return err
 	}
-	return h.service.Start(packetConn)
+	scope.Add(h.listener.Close)
+	err = h.service.Start(packetConn)
+	if err != nil {
+		return err
+	}
+	scope.Add(h.service.Close)
+	return nil
 }
 
 func (h *Inbound) InterfaceUpdated(ctx context.Context) {
 	h.service.Reset()
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(
-		h.listener,
-		h.tlsConfig,
-		common.PtrOrNil(h.service),
-	)
 }

@@ -158,3 +158,74 @@ func TestCloseUsersMuteDoesNotLiftOnQuiet(t *testing.T) {
 		t.Fatal("expected a removed user to stay muted")
 	}
 }
+
+type missingSession struct{}
+
+func (missingSession) Close() error { return ErrNotClosed }
+
+// A closer that finds nothing (a QUIC session that has moved to another port)
+// leaves the address muted, as it would be without a closer.
+func TestCloserMissFallsBackToMute(t *testing.T) {
+	registry := NewRegistry()
+	registry.Track("10.0.0.1:1000", missingSession{})
+	registry.Bind("alice", "10.0.0.1:1000")
+	registry.CloseUsers(map[string]struct{}{})
+	if registry.Allowed("10.0.0.1:1000") {
+		t.Fatal("expected a removed user's address to be muted when its closer missed")
+	}
+
+	registry = NewRegistry()
+	registry.Track("10.0.0.1:1000", missingSession{})
+	registry.Bind("alice", "10.0.0.1:1000")
+	registry.KickUserSessions("alice")
+	if registry.Allowed("10.0.0.1:1000") {
+		t.Fatal("expected a kicked address to be muted when its closer missed")
+	}
+	registry.access.Lock()
+	registry.blocked["10.0.0.1:1000"].at = time.Now().Add(-2 * kickMuteWindow)
+	registry.access.Unlock()
+	if !registry.Allowed("10.0.0.1:1000") {
+		t.Fatal("expected the kick mute to lift after the window")
+	}
+}
+
+// Sources the QUIC inbounds never untrack are swept once idle, so port hops and
+// NAT rebinds do not pile up until the next user change (#1294).
+func TestNewSourceSweepsIdleOnes(t *testing.T) {
+	registry := NewRegistry()
+	registry.Bind("alice", "10.0.0.1:1000")
+	registry.Bind("alice", "10.0.0.1:1001")
+
+	registry.access.Lock()
+	registry.sources["10.0.0.1:1000"].lastSeen = time.Now().Add(-2 * idleTimeout)
+	registry.swept = time.Now().Add(-2 * sweepInterval)
+	registry.access.Unlock()
+
+	registry.Bind("alice", "10.0.0.1:1002")
+
+	registry.access.Lock()
+	defer registry.access.Unlock()
+	if _, ok := registry.sources["10.0.0.1:1000"]; ok {
+		t.Fatal("expected the idle source to be swept")
+	}
+	if len(registry.sources) != 2 {
+		t.Fatalf("expected 2 live sources, got %d", len(registry.sources))
+	}
+}
+
+// A sweep drops the idle source but not its removal block.
+func TestSweepKeepsLiveBlock(t *testing.T) {
+	registry := NewRegistry()
+	registry.Bind("alice", "10.0.0.1:1000")
+	registry.CloseUsers(map[string]struct{}{})
+
+	registry.access.Lock()
+	registry.sources["10.0.0.1:1000"].lastSeen = time.Now().Add(-2 * idleTimeout)
+	registry.swept = time.Time{}
+	registry.access.Unlock()
+
+	registry.Bind("bob", "10.0.0.2:1000")
+	if registry.Allowed("10.0.0.1:1000") {
+		t.Fatal("expected the removed user's address to stay muted after a sweep")
+	}
+}

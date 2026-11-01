@@ -261,3 +261,41 @@ func TestResetUsageCountsTrafficArrivingWhileOpen(t *testing.T) {
 		t.Errorf("totals = %d/%d, want 3500/9000", reset.TotalUp, reset.TotalDown)
 	}
 }
+
+// A periodic reset that re-enables a depleted client must move LastUpdate, or
+// the panel never reloads and keeps showing the client as disabled (#1287).
+func TestPeriodicResetReenablesAndAnnounces(t *testing.T) {
+	db := clientTestDB(t)
+	s := &ClientService{}
+
+	const now = int64(1_000_000)
+	c := createClient(t, db, &model.Client{
+		Name:      "depleted",
+		Enable:    true,
+		AutoReset: true,
+		ResetDays: 30,
+		NextReset: now - 1,
+		Volume:    100,
+		Up:        200,
+		Inbounds:  json.RawMessage(`[7]`),
+	})
+	if err := db.Model(model.Client{}).Where("id = ?", c.Id).Update("enable", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	LastUpdate = 0
+
+	ids, err := s.ResetClients(db, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reload(t, db, c.Id)
+	if !got.Enable || got.Up != 0 {
+		t.Errorf("expected enabled with traffic reset, got enable=%v up=%d", got.Enable, got.Up)
+	}
+	if len(ids) != 1 || ids[0] != 7 {
+		t.Errorf("expected its inbound to be updated, got %v", ids)
+	}
+	if LastUpdate != now {
+		t.Errorf("LastUpdate = %d, want %d so the panel reloads", LastUpdate, now)
+	}
+}

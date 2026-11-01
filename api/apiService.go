@@ -28,6 +28,7 @@ type ApiService struct {
 	service.PanelService
 	service.StatsService
 	service.ServerService
+	service.UpdateService
 }
 
 func (a *ApiService) LoadData(c *gin.Context) {
@@ -280,6 +281,15 @@ func (a *ApiService) GetKeypairs(c *gin.Context) {
 	jsonObj(c, keypair, nil)
 }
 
+func (a *ApiService) CheckUpdate(c *gin.Context) {
+	jsonObj(c, a.UpdateService.CheckUpdate(), nil)
+}
+
+func (a *ApiService) Upgrade(c *gin.Context) {
+	err := a.UpdateService.Upgrade()
+	jsonMsg(c, "update", err)
+}
+
 func (a *ApiService) GetDb(c *gin.Context) {
 	exclude := c.Query("exclude")
 	db, err := database.GetDb(exclude)
@@ -383,11 +393,14 @@ func (a *ApiService) SetMaintenance(c *gin.Context) {
 }
 
 func (a *ApiService) ResetTraffic(c *gin.Context) {
-	if err := a.ClientService.ResetAllClientsTraffic(); err != nil {
+	inboundIds, err := a.ClientService.ResetAllClientsTraffic()
+	if err != nil {
 		jsonMsg(c, "resetTraffic", err)
 		return
 	}
-	err := a.ConfigService.RestartCore()
+	if len(inboundIds) > 0 {
+		err = a.InboundService.UpdateInboundsUsers(database.GetDB(), inboundIds)
+	}
 	jsonMsg(c, "resetTraffic", err)
 }
 

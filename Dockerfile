@@ -1,14 +1,9 @@
-# Base images are pinned by digest, not by a floating tag. "node:alpine" and
-# "alpine" resolved to whatever was published that day, so two builds of the
-# same commit could differ, and a bad upstream push reached every build at once.
-# The tag is kept alongside the digest so it is obvious what is pinned; the
-# digest is what docker enforces.
-FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:ef24c5053d50fdc3e4e56eb4e7ddb7861874ab0fdc797046ba897581deb8e868 AS front-builder
+FROM --platform=$BUILDPLATFORM node:26-alpine AS front-builder
 WORKDIR /app
 COPY frontend/ ./
-RUN npm install && npm run build
+RUN npm ci && npm run build
 
-FROM golang:1.26-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS backend-builder
+FROM golang:1.27-alpine AS backend-builder
 WORKDIR /app
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -30,10 +25,16 @@ RUN apk upgrade --no-cache --scripts=no apk-tools && \
 
 ENV CC=gcc
 
-RUN CRONET_ARCH="$TARGETARCH" && \
-    CRONET_URL="https://github.com/SagerNet/cronet-go/releases/latest/download/libcronet-linux-${CRONET_ARCH}.so"; \
-    echo "Downloading $CRONET_URL" && \
-    wget -q -O ./libcronet.so "$CRONET_URL" && \
+# Modules in their own layer, so a source-only change keeps them cached.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# libcronet ships inside the cronet-go lib module pinned in go.mod, so
+# copy it out of the module cache: the library is exactly the go.mod
+# version and go.sum has already verified it. (It used to be fetched
+# from releases/latest with no verification at all.)
+RUN CRONET_DIR=$(go list -m -f '{{.Dir}}' github.com/sagernet/cronet-go/lib/linux_${TARGETARCH}) && \
+    cp "$CRONET_DIR/libcronet.so" ./libcronet.so && \
     chmod 755 ./libcronet.so
 
 COPY . .
@@ -45,7 +46,7 @@ RUN if [ "$TARGETARCH" = "arm" ]; then export GOARM=7; [ "$TARGETVARIANT" = "v6"
     LDFLAGS=$(ldflags_for docker) && \
     go build -ldflags="$LDFLAGS" -tags "$TAGS" -o sui main.go
 
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3
 LABEL org.opencontainers.image.authors="alireza7@gmail.com"
 ENV TZ=Asia/Tehran
 WORKDIR /app

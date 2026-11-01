@@ -3,6 +3,7 @@ package util
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -351,6 +352,21 @@ func tuic(u *url.URL, i int) (*map[string]interface{}, string, error) {
 }
 
 func ss(u *url.URL, i int) (*map[string]interface{}, string, error) {
+	if u.User == nil {
+		decoded, err := decodeBase64(u.Host + strings.TrimSuffix(u.Path, "/"))
+		if err != nil {
+			return nil, "", common.NewError("Unsupported shadowsocks")
+		}
+		idx := strings.LastIndex(string(decoded), "@")
+		if idx == -1 {
+			return nil, "", common.NewError("Unsupported shadowsocks")
+		}
+		legacy := *u
+		legacy.User = url.UserPassword(splitMethod(string(decoded[:idx])))
+		legacy.Host = string(decoded[idx+1:])
+		legacy.Path = ""
+		u = &legacy
+	}
 	query, _ := url.ParseQuery(u.RawQuery)
 	host, portStr, _ := net.SplitHostPort(u.Host)
 	port := 443
@@ -408,6 +424,11 @@ func ss(u *url.URL, i int) (*map[string]interface{}, string, error) {
 		}
 	}
 	return &ss, tag, nil
+}
+
+func splitMethod(userInfo string) (string, string) {
+	method, password, _ := strings.Cut(userInfo, ":")
+	return method, password
 }
 
 func parseNaiveLink(u *url.URL, i int) (*map[string]interface{}, string, error) {
@@ -533,6 +554,43 @@ func getTransport(tp_type string, q *url.Values) map[string]interface{} {
 		transport["host"] = tp_host
 	}
 	return transport
+}
+
+// GetOutboundForClash preserves XHTTP only for the Clash YAML export path.
+// Regular external links for Happ and sing-box JSON exports stay unchanged.
+func GetOutboundForClash(uri string, i int) (*map[string]interface{}, string, error) {
+	outbound, tag, err := GetOutbound(uri, i)
+	if err != nil || outbound == nil {
+		return outbound, tag, err
+	}
+	u, parseErr := url.Parse(uri)
+	if parseErr != nil || u.Scheme != "vless" {
+		return outbound, tag, err
+	}
+	q := u.Query()
+	tp := strings.ToLower(q.Get("type"))
+	if tp != "xhttp" && tp != "splithttp" {
+		return outbound, tag, err
+	}
+	transport := map[string]interface{}{"type": "xhttp"}
+	for _, key := range []string{"host", "path", "mode"} {
+		if q.Has(key) {
+			transport[key] = q.Get(key)
+		}
+	}
+	if raw := q.Get("extra"); raw != "" && raw != "null" {
+		var extra map[string]interface{}
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		if decoder.Decode(&extra) == nil && len(extra) > 0 {
+			var trailing interface{}
+			if decoder.Decode(&trailing) == io.EOF {
+				transport["extra"] = extra
+			}
+		}
+	}
+	(*outbound)["transport"] = transport
+	return outbound, tag, nil
 }
 
 func getTls(security string, q *url.Values) map[string]interface{} {
